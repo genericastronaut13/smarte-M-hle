@@ -1,0 +1,599 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "HX711.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// =====================
+// WIFI & MQTT KONFIGURATION
+// =====================
+const char* ssid = "DEIN_WIFI_NAME";
+const char* password = "DEIN_WIFI_PASSWORT";
+const char* mqtt_server = "DEIN_MQTT_BROKER_IP";  // z.B. "192.168.1.100"
+const int mqtt_port = 1883;
+const char* mqtt_user = "";  // Falls benötigt
+const char* mqtt_password = "";  // Falls benötigt
+
+// MQTT Topics
+const char* topic_weight1 = "kaffeemuehle/weight1";
+const char* topic_weight2 = "kaffeemuehle/weight2";
+const char* topic_total = "kaffeemuehle/total";
+const char* topic_status = "kaffeemuehle/status";
+const char* topic_calibration = "kaffeemuehle/calibration";
+
+// =====================
+// DISPLAY
+// =====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// =====================
+// HX711 MIT GUTEN PINS
+// =====================
+HX711 scale1;
+HX711 scale2;
+#define DT1 4     // Wägezelle 1: Stabil
+#define SCK1 5    // Wägezelle 1: Stabil
+#define DT2 25    // WICHTIG: GUTER Pin für Zelle 2
+#define SCK2 26   // WICHTIG: GUTER Pin für Zelle 2
+
+// =====================
+// TASTER
+// =====================
+#define TARE_PIN 32    // Tarieren
+#define CAL_PIN 33     // Kalibrieren
+
+// =====================
+// RELAIS & SCHALTER
+// =====================
+#define RELAY_PIN 18
+#define START_SWITCH 19
+
+// =====================
+// VARIABLEN
+// =====================
+float weight1 = 0;
+float weight2 = 0;
+float totalWeight = 0;
+float targetWeight = 18.0;
+float offset = 0.3;
+float calFactor1 = 1.0;
+float calFactor2 = 1.0;
+const float CALIBRATION_WEIGHT = 105.0;
+
+bool scale1OK = false;
+bool scale2OK = false;
+bool calibrating = false;
+int calibrationStep = 0;
+
+unsigned long lastTareTime = 0;
+unsigned long lastCalTime = 0;
+const unsigned long DEBOUNCE_TIME = 1000;
+
+// MQTT Variablen
+unsigned long lastMQTTPublish = 0;
+const unsigned long MQTT_PUBLISH_INTERVAL = 1000;  // 1 Sekunde
+bool wifiConnected = false;
+bool mqttConnected = false;
+
+// =====================
+// MQTT & WIFI OBJEKTE
+// =====================
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =====================
+// FUNKTIONEN
+// =====================
+
+void initDisplay() {
+  Wire.begin(21, 22);
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("Display nicht gefunden!");
+      return;
+    }
+  }
+  
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(150);
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 25);
+  display.println("System startet...");
+  display.display();
+}
+
+bool initScale(HX711 &scale, int dtPin, int sckPin, float calFactor, const char* name) {
+  Serial.print("Initialisiere ");
+  Serial.print(name);
+  Serial.print(" (DT=");
+  Serial.print(dtPin);
+  Serial.print(", SCK=");
+  Serial.print(sckPin);
+  Serial.print(")... ");
+  
+  scale.begin(dtPin, sckPin);
+  
+  if(scale.wait_ready_timeout(2000)) {
+    scale.set_scale(calFactor);
+    scale.tare();
+    Serial.println("OK");
+    return true;
+  } else {
+    Serial.println("FEHLER");
+    return false;
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  
+  // Titel mit WiFi-Status
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("KAFFEEMUEHLE");
+  
+  // WiFi & MQTT Status
+  display.setCursor(100, 0);
+  if(wifiConnected) {
+    if(mqttConnected) {
+      display.print("M");  // MQTT verbunden
+    } else {
+      display.print("W");  // Nur WiFi
+    }
+  } else {
+    display.print("X");    // Keine Verbindung
+  }
+  
+  // Wägezellen Status
+  display.setCursor(110, 0);
+  if(scale1OK && scale2OK) display.print("✓");
+  else if(scale1OK || scale2OK) display.print("!");
+  else display.print("✗");
+  
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  if (calibrating) {
+    display.setCursor(0, 15);
+    display.println("KALIBRIERUNG");
+    
+    switch(calibrationStep) {
+      case 1:
+        display.setCursor(0, 25);
+        display.println("Zelle 1 leer lassen");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 2:
+        display.setCursor(0, 25);
+        display.print(CALIBRATION_WEIGHT, 0);
+        display.println("g auf Zelle 1");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 3:
+        display.setCursor(0, 25);
+        display.println("Zelle 2 leer lassen");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 4:
+        display.setCursor(0, 25);
+        display.print(CALIBRATION_WEIGHT, 0);
+        display.println("g auf Zelle 2");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 5:
+        display.setCursor(0, 25);
+        display.println("KALIBRIERT!");
+        break;
+    }
+  } else {
+    // Normale Anzeige
+    display.setTextSize(2);
+    display.setCursor(0, 15);
+    display.print(totalWeight, 1);
+    display.println(" g");
+    
+    display.setTextSize(1);
+    display.setCursor(0, 35);
+    if(scale1OK) {
+      display.print("Z1: ");
+      display.print(weight1, 1);
+      display.println(" g");
+    } else {
+      display.println("Z1: ---");
+    }
+    
+    display.setCursor(64, 35);
+    if(scale2OK) {
+      display.print("Z2: ");
+      display.print(weight2, 1);
+      display.println(" g");
+    } else {
+      display.println("Z2: ---");
+    }
+    
+    display.setCursor(0, 45);
+    display.print("Ziel: ");
+    display.print(targetWeight, 1);
+    display.println(" g");
+    
+    // MQTT Info
+    if (!wifiConnected) {
+      display.setCursor(0, 55);
+      display.println("Kein WiFi");
+    } else if (!mqttConnected) {
+      display.setCursor(0, 55);
+      display.println("Kein MQTT");
+    } else {
+      display.setCursor(0, 55);
+      display.print("MQTT: Online");
+    }
+  }
+  
+  display.display();
+}
+
+void readScales() {
+  static unsigned long lastRead = 0;
+  unsigned long now = millis();
+  
+  if(now - lastRead > 200) {
+    if(scale1OK && scale1.is_ready()) {
+      weight1 = scale1.get_units(2);
+    }
+    
+    if(scale2OK && scale2.is_ready()) {
+      weight2 = scale2.get_units(2);
+    }
+    
+    totalWeight = weight1 + weight2;
+    lastRead = now;
+  }
+}
+
+void tareScales() {
+  if (calibrating) return;
+  
+  Serial.println("\n=== TARIERUNG ===");
+  
+  if(scale1OK) {
+    scale1.tare();
+    Serial.println("Wägezelle 1 tariert");
+  }
+  
+  if(scale2OK) {
+    scale2.tare();
+    Serial.println("Wägezelle 2 tariert");
+  }
+  
+  weight1 = 0;
+  weight2 = 0;
+  totalWeight = 0;
+  
+  // MQTT Status senden
+  publishMQTTStatus("tare_completed");
+  
+  Serial.println("Tarierung abgeschlossen");
+  updateDisplay();
+}
+
+// WiFi Verbindung
+void setupWiFi() {
+  Serial.println();
+  Serial.print("Verbinde mit WiFi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    
+    // Display-Update während Verbindung
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("WiFi Verbindung...");
+    display.setCursor(0, 20);
+    display.print("SSID: ");
+    display.println(ssid);
+    display.setCursor(0, 40);
+    display.print("Versuch ");
+    display.print(attempts);
+    display.print("/20");
+    display.display();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("");
+    Serial.println("WiFi verbunden!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+    
+    // MQTT starten
+    client.setServer(mqtt_server, mqtt_port);
+  } else {
+    wifiConnected = false;
+    Serial.println("WiFi Verbindung fehlgeschlagen!");
+  }
+}
+
+// MQTT Callback (für eingehende Nachrichten)
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("MQTT Nachricht erhalten [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
+  
+  // Kommandos verarbeiten
+  if (String(topic) == "kaffeemuehle/control") {
+    if (message == "tare") {
+      tareScales();
+    } else if (message == "calibrate") {
+      // Kalibrierung per MQTT starten
+      if (!calibrating) {
+        calibrating = true;
+        calibrationStep = 1;
+        Serial.println("Kalibrierung per MQTT gestartet");
+      }
+    } else if (message.startsWith("target:")) {
+      // Zielgewicht setzen
+      String targetStr = message.substring(7);
+      targetWeight = targetStr.toFloat();
+      Serial.print("Zielgewicht per MQTT gesetzt: ");
+      Serial.print(targetWeight);
+      Serial.println(" g");
+    }
+  }
+}
+
+// MQTT Verbindung
+void reconnectMQTT() {
+  if (!wifiConnected) return;
+  
+  // Versuche MQTT zu verbinden
+  if (!client.connected()) {
+    Serial.print("Verbinde mit MQTT Broker...");
+    
+    // Client-ID mit MAC-Adresse für Eindeutigkeit
+    String clientId = "Kaffeemuehle-";
+    clientId += String(WiFi.macAddress());
+    
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
+      mqttConnected = true;
+      Serial.println("verbunden!");
+      
+      // Topics subscriben
+      client.subscribe("kaffeemuehle/control");
+      client.subscribe("kaffeemuehle/settings");
+      
+      // Online-Status senden
+      publishMQTTStatus("online");
+      
+    } else {
+      mqttConnected = false;
+      Serial.print("fehlgeschlagen, rc=");
+      Serial.print(client.state());
+      Serial.println(" versuche es in 5 Sekunden erneut");
+    }
+  }
+}
+
+// MQTT Daten senden
+void publishMQTTData() {
+  if (!mqttConnected) return;
+  
+  unsigned long now = millis();
+  if (now - lastMQTTPublish > MQTT_PUBLISH_INTERVAL) {
+    lastMQTTPublish = now;
+    
+    // Gewichte senden
+    char weight1Str[10];
+    dtostrf(weight1, 1, 2, weight1Str);
+    client.publish(topic_weight1, weight1Str);
+    
+    char weight2Str[10];
+    dtostrf(weight2, 1, 2, weight2Str);
+    client.publish(topic_weight2, weight2Str);
+    
+    char totalStr[10];
+    dtostrf(totalWeight, 1, 2, totalStr);
+    client.publish(topic_total, totalStr);
+    
+    // Debug auf Serial
+    Serial.print("MQTT gesendet: Z1=");
+    Serial.print(weight1Str);
+    Serial.print("g, Z2=");
+    Serial.print(weight2Str);
+    Serial.print("g, Total=");
+    Serial.print(totalStr);
+    Serial.println("g");
+  }
+}
+
+void publishMQTTStatus(const char* status) {
+  if (!mqttConnected) return;
+  
+  client.publish(topic_status, status);
+  Serial.print("Status gesendet: ");
+  Serial.println(status);
+}
+
+void publishCalibrationData(float factor1, float factor2) {
+  if (!mqttConnected) return;
+  
+  char message[100];
+  sprintf(message, "{\"factor1\":%.2f,\"factor2\":%.2f}", factor1, factor2);
+  client.publish(topic_calibration, message);
+  Serial.print("Kalibrierdaten gesendet: ");
+  Serial.println(message);
+}
+
+// Kalibrierung (vereinfacht, nur wichtigste Teile)
+void calibrateScale() {
+  static unsigned long lastButtonPress = 0;
+  unsigned long now = millis();
+  
+  if (!calibrating && digitalRead(CAL_PIN) == LOW && (now - lastCalTime) > DEBOUNCE_TIME) {
+    lastCalTime = now;
+    calibrating = true;
+    calibrationStep = 1;
+    Serial.println("\n=== KALIBRIERUNG GESTARTET ===");
+    publishMQTTStatus("calibration_started");
+    updateDisplay();
+    return;
+  }
+  
+  if (calibrating && digitalRead(CAL_PIN) == LOW && (now - lastButtonPress) > DEBOUNCE_TIME) {
+    lastButtonPress = now;
+    
+    // Hier deine Kalibrierungslogik...
+    // (Kopiere sie aus dem vorherigen Code)
+    
+    // Am Ende der Kalibrierung:
+    if (calibrationStep == 5) {
+      publishMQTTStatus("calibration_completed");
+      publishCalibrationData(calFactor1, calFactor2);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n=== ESP32 KAFFEEMUEHLE MIT MQTT ===");
+  
+  // Display
+  initDisplay();
+  delay(1000);
+  
+  // WiFi
+  setupWiFi();
+  
+  // MQTT Callback setzen
+  client.setCallback(mqttCallback);
+  
+  // Taster
+  pinMode(TARE_PIN, INPUT_PULLUP);
+  pinMode(CAL_PIN, INPUT_PULLUP);
+  
+  // Wägezellen
+  Serial.println("\nInitialisiere Wägezellen...");
+  scale1OK = initScale(scale1, DT1, SCK1, 1.0, "Wägezelle 1");
+  scale2OK = initScale(scale2, DT2, SCK2, 1.0, "Wägezelle 2");
+  
+  // Relais
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  pinMode(START_SWITCH, INPUT_PULLUP);
+  
+  // Erste MQTT Verbindung
+  reconnectMQTT();
+  
+  Serial.println("\n=== SYSTEM BEREIT ===");
+  Serial.print("MQTT Broker: ");
+  Serial.println(mqtt_server);
+  Serial.print("Topics:");
+  Serial.println(topic_weight1);
+  Serial.println(topic_weight2);
+  Serial.println(topic_total);
+  Serial.println(topic_status);
+  
+  updateDisplay();
+}
+
+void loop() {
+  unsigned long now = millis();
+  
+  // MQTT Verbindung prüfen
+  if (!client.connected()) {
+    mqttConnected = false;
+    reconnectMQTT();
+  } else {
+    mqttConnected = true;
+    client.loop();  // MQTT Nachrichten verarbeiten
+  }
+  
+  // TARE Taste
+  if(!calibrating && digitalRead(TARE_PIN) == LOW && (now - lastTareTime) > DEBOUNCE_TIME) {
+    lastTareTime = now;
+    tareScales();
+  }
+  
+  // Kalibrierung
+  calibrateScale();
+  
+  // Wägezellen lesen
+  readScales();
+  
+  // MQTT Daten senden
+  publishMQTTData();
+  
+  // Mahlung starten
+  static bool grinding = false;
+  if(!calibrating && digitalRead(START_SWITCH) == LOW && !grinding) {
+    grinding = true;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("Mahlung gestartet");
+    publishMQTTStatus("grinding_started");
+    updateDisplay();
+    
+    while(totalWeight < (targetWeight - offset) && grinding) {
+      readScales();
+      publishMQTTData();  // Daten während Mahlung senden
+      
+      static unsigned long lastGrindUpdate = 0;
+      if(millis() - lastGrindUpdate > 200) {
+        updateDisplay();
+        lastGrindUpdate = millis();
+      }
+      
+      if(totalWeight > targetWeight * 1.5) {
+        Serial.println("SICHERHEIT: Zu schwer!");
+        publishMQTTStatus("safety_stop");
+        break;
+      }
+      
+      delay(50);
+    }
+    
+    digitalWrite(RELAY_PIN, LOW);
+    grinding = false;
+    Serial.print("Mahlung beendet: ");
+    Serial.print(totalWeight, 1);
+    Serial.println(" g");
+    publishMQTTStatus("grinding_completed");
+    updateDisplay();
+    
+    delay(1000);
+  }
+  
+  // Display aktualisieren
+  static unsigned long lastUpdate = 0;
+  if(now - lastUpdate > 300) {
+    updateDisplay();
+    lastUpdate = now;
+  }
+  
+  delay(50);
+}
