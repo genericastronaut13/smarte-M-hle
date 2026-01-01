@@ -1,0 +1,555 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "HX711.h"
+
+// =====================
+// DISPLAY
+// =====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// =====================
+// HX711 MIT GUTEN PINS
+// =====================
+HX711 scale1;
+HX711 scale2;
+#define DT1 4     // Wägezelle 1: Stabil
+#define SCK1 5    // Wägezelle 1: Stabil
+#define DT2 25    // WICHTIG: GUTER Pin für Zelle 2
+#define SCK2 26   // WICHTIG: GUTER Pin für Zelle 2
+
+// =====================
+// TASTER
+// =====================
+#define TARE_PIN 32    // Tarieren
+#define CAL_PIN 33     // Kalibrieren
+
+// =====================
+// RELAIS & SCHALTER
+// =====================
+#define RELAY_PIN 18
+#define START_SWITCH 19
+
+// =====================
+// VARIABLEN
+// =====================
+float weight1 = 0;
+float weight2 = 0;
+float totalWeight = 0;
+float targetWeight = 18.0;
+float offset = 0.3;
+float calFactor1 = 1.0;  // Start mit 1.0
+float calFactor2 = 1.0;  // Start mit 1.0
+const float CALIBRATION_WEIGHT = 105.0;  // Bekanntes Kalibriergewicht
+
+bool scale1OK = false;
+bool scale2OK = false;
+bool calibrating = false;
+int calibrationStep = 0;
+
+unsigned long lastTareTime = 0;
+unsigned long lastCalTime = 0;
+const unsigned long DEBOUNCE_TIME = 1000;
+
+// =====================
+// FUNKTIONEN
+// =====================
+
+void initDisplay() {
+  Wire.begin(21, 22);
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("Display nicht gefunden!");
+      return;
+    }
+  }
+  
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(150);
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 25);
+  display.println("System startet...");
+  display.display();
+}
+
+bool initScale(HX711 &scale, int dtPin, int sckPin, float calFactor, const char* name) {
+  Serial.print("Initialisiere ");
+  Serial.print(name);
+  Serial.print(" (DT=");
+  Serial.print(dtPin);
+  Serial.print(", SCK=");
+  Serial.print(sckPin);
+  Serial.print(")... ");
+  
+  scale.begin(dtPin, sckPin);
+  
+  if(scale.wait_ready_timeout(2000)) {
+    scale.set_scale(calFactor);
+    scale.tare();  // Normales Tarieren für Start
+    Serial.println("OK");
+    
+    // Testwert anzeigen
+    delay(200);
+    float test = scale.get_units(3);
+    Serial.print("  Test: ");
+    Serial.print(test, 1);
+    Serial.println(" g");
+    
+    return true;
+  } else {
+    Serial.println("FEHLER");
+    return false;
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  
+  // Titel
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("KAFFEEMUEHLE");
+  
+  // Status-LEDs
+  display.setCursor(100, 0);
+  if(scale1OK) display.print("✓");
+  else display.print("✗");
+  
+  display.setCursor(110, 0);
+  if(scale2OK) display.print("✓");
+  else display.print("✗");
+  
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  if (calibrating) {
+    display.setTextSize(1);
+    display.setCursor(0, 15);
+    display.println("KALIBRIERUNG");
+    
+    switch(calibrationStep) {
+      case 1:
+        display.setCursor(0, 25);
+        display.println("Zelle 1 leer lassen");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 2:
+        display.setCursor(0, 25);
+        display.print(CALIBRATION_WEIGHT, 0);
+        display.println("g auf Zelle 1");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        display.setCursor(0, 45);
+        display.print("Gemessen: ");
+        display.print(weight1, 1);
+        display.println(" g");
+        break;
+      case 3:
+        display.setCursor(0, 25);
+        display.println("Zelle 2 leer lassen");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        break;
+      case 4:
+        display.setCursor(0, 25);
+        display.print(CALIBRATION_WEIGHT, 0);
+        display.println("g auf Zelle 2");
+        display.setCursor(0, 35);
+        display.println("CAL-Taste druecken");
+        display.setCursor(0, 45);
+        display.print("Gemessen: ");
+        display.print(weight2, 1);
+        display.println(" g");
+        break;
+      case 5:
+        display.setCursor(0, 25);
+        display.println("KALIBRIERT!");
+        display.setCursor(0, 35);
+        display.print("Z1-Faktor: ");
+        display.println(calFactor1, 0);
+        display.setCursor(0, 45);
+        display.print("Z2-Faktor: ");
+        display.print(calFactor2, 0);
+        break;
+    }
+  } else {
+    // Normale Anzeige
+    display.setTextSize(2);
+    display.setCursor(0, 15);
+    display.print(totalWeight, 1);
+    display.println(" g");
+    
+    display.setTextSize(1);
+    display.setCursor(0, 35);
+    if(scale1OK) {
+      display.print("Z1: ");
+      display.print(weight1, 1);
+      display.println(" g");
+    } else {
+      display.println("Z1: ---");
+    }
+    
+    display.setCursor(64, 35);
+    if(scale2OK) {
+      display.print("Z2: ");
+      display.print(weight2, 1);
+      display.println(" g");
+    } else {
+      display.println("Z2: ---");
+    }
+    
+    display.setCursor(0, 45);
+    display.print("Ziel: ");
+    display.print(targetWeight, 1);
+    display.println(" g");
+    
+    // Aktuelle Faktoren anzeigen
+    if (scale1OK && scale2OK) {
+      display.setCursor(0, 55);
+      display.print("CF1:");
+      display.print(calFactor1, 0);
+      display.print(" CF2:");
+      display.print(calFactor2, 0);
+    }
+  }
+  
+  display.display();
+}
+
+void readScales() {
+  static unsigned long lastRead = 0;
+  unsigned long now = millis();
+  
+  if(now - lastRead > 200) {
+    if(scale1OK && scale1.is_ready()) {
+      weight1 = scale1.get_units(2);
+    }
+    
+    if(scale2OK && scale2.is_ready()) {
+      weight2 = scale2.get_units(2);
+    }
+    
+    totalWeight = weight1 + weight2;
+    lastRead = now;
+  }
+}
+
+void tareScales() {
+  if (calibrating) return;
+  
+  Serial.println("\n=== TARIERUNG ===");
+  
+  if(scale1OK) {
+    scale1.tare();
+    Serial.println("Wägezelle 1 tariert");
+  }
+  
+  if(scale2OK) {
+    scale2.tare();
+    Serial.println("Wägezelle 2 tariert");
+  }
+  
+  weight1 = 0;
+  weight2 = 0;
+  totalWeight = 0;
+  
+  Serial.println("Tarierung abgeschlossen");
+  updateDisplay();
+}
+
+// VERBESSERTE KALIBRIERUNG
+void calibrateScale() {
+  static unsigned long lastButtonPress = 0;
+  unsigned long now = millis();
+  
+  // Kalibrierung starten
+  if (!calibrating && digitalRead(CAL_PIN) == LOW && (now - lastCalTime) > DEBOUNCE_TIME) {
+    lastCalTime = now;
+    calibrating = true;
+    calibrationStep = 1;
+    Serial.println("\n=== KALIBRIERUNG GESTARTET ===");
+    Serial.println("Schritt 1: Zelle 1 leer lassen");
+    updateDisplay();
+    return;
+  }
+  
+  // Kalibrierungsschritte
+  if (calibrating && digitalRead(CAL_PIN) == LOW && (now - lastButtonPress) > DEBOUNCE_TIME) {
+    lastButtonPress = now;
+    
+    switch(calibrationStep) {
+      case 1:  // Zelle 1 leer
+        Serial.println("\n--- Zelle 1 leer ---");
+        if (scale1OK) {
+          // Reset: Power cycle für sauberen Start
+          scale1.power_down();
+          delay(100);
+          scale1.power_up();
+          delay(500);
+          
+          // MEHRFACHE MESSUNG für bessere Genauigkeit
+          long rawZeroSum = 0;
+          for (int i = 0; i < 20; i++) {
+            rawZeroSum += scale1.read();
+            delay(10);
+          }
+          long rawZero1 = rawZeroSum / 20;
+          
+          Serial.print("Mittelwert leer: ");
+          Serial.println(rawZero1);
+          
+          // WICHTIG: Zuerst Faktor auf 1 setzen
+          scale1.set_scale(1.0);
+          // Dann Offset setzen
+          scale1.set_offset(rawZero1);
+          
+          Serial.println("Offset gesetzt, Faktor=1.0");
+        }
+        calibrationStep = 2;
+        Serial.println("\nSchritt 2: " + String(CALIBRATION_WEIGHT) + "g auf Zelle 1 legen");
+        Serial.println("Dann CAL-Taste drücken");
+        updateDisplay();
+        break;
+        
+      case 2:  // Zelle 1 mit 105g
+        Serial.println("\n--- Zelle 1 mit " + String(CALIBRATION_WEIGHT) + "g ---");
+        if (scale1OK) {
+          // Warten für Stabilisierung
+          delay(1000);
+          
+          // MEHRFACHE MESSUNG mit Gewicht
+          long rawWeightSum = 0;
+          for (int i = 0; i < 20; i++) {
+            rawWeightSum += scale1.read();
+            delay(10);
+          }
+          long rawWithWeight1 = rawWeightSum / 20;
+          
+          Serial.print("Mittelwert mit Gewicht: ");
+          Serial.println(rawWithWeight1);
+          
+          // Differenz berechnen (ohne Offset, da wir schon set_offset verwendet haben)
+          long rawDiff1 = rawWithWeight1 - scale1.get_offset();
+          Serial.print("Reine Gewichts-Differenz: ");
+          Serial.println(rawDiff1);
+          
+          // Kalibrierfaktor berechnen
+          // WICHTIG: Raw-Differenz geteilt durch bekanntes Gewicht
+          calFactor1 = (float)rawDiff1 / CALIBRATION_WEIGHT;
+          
+          Serial.print("Neuer Kalibrierfaktor Zelle 1: ");
+          Serial.println(calFactor1, 3);
+          
+          // Jetzt den richtigen Faktor setzen
+          scale1.set_scale(calFactor1);
+          
+          // Und nochmal tarieren (jetzt mit richtigem Faktor)
+          scale1.tare();
+          
+          // Testmessung
+          delay(300);
+          float testReading = scale1.get_units(5);
+          Serial.print("Test nach Kalibrierung: ");
+          Serial.print(testReading, 1);
+          Serial.println(" g");
+          
+          if (abs(testReading - CALIBRATION_WEIGHT) < 1.0) {
+            Serial.println("✓ Exzellente Kalibrierung!");
+          } else if (abs(testReading - CALIBRATION_WEIGHT) < 3.0) {
+            Serial.println("✓ Gute Kalibrierung");
+          } else {
+            Serial.print("⚠ Abweichung: ");
+            Serial.print(testReading - CALIBRATION_WEIGHT, 1);
+            Serial.println(" g");
+          }
+        }
+        calibrationStep = 3;
+        Serial.println("\nSchritt 3: Zelle 2 leer lassen");
+        Serial.println("CAL-Taste drücken");
+        updateDisplay();
+        break;
+        
+      case 3:  // Zelle 2 leer
+        Serial.println("\n--- Zelle 2 leer ---");
+        if (scale2OK) {
+          scale2.power_down();
+          delay(100);
+          scale2.power_up();
+          delay(500);
+          
+          long rawZeroSum = 0;
+          for (int i = 0; i < 20; i++) {
+            rawZeroSum += scale2.read();
+            delay(10);
+          }
+          long rawZero2 = rawZeroSum / 20;
+          
+          Serial.print("Mittelwert leer: ");
+          Serial.println(rawZero2);
+          
+          scale2.set_scale(1.0);
+          scale2.set_offset(rawZero2);
+        }
+        calibrationStep = 4;
+        Serial.println("\nSchritt 4: " + String(CALIBRATION_WEIGHT) + "g auf Zelle 2 legen");
+        Serial.println("CAL-Taste drücken");
+        updateDisplay();
+        break;
+        
+      case 4:  // Zelle 2 mit 105g
+        Serial.println("\n--- Zelle 2 mit " + String(CALIBRATION_WEIGHT) + "g ---");
+        if (scale2OK) {
+          delay(1000);
+          
+          long rawWeightSum = 0;
+          for (int i = 0; i < 20; i++) {
+            rawWeightSum += scale2.read();
+            delay(10);
+          }
+          long rawWithWeight2 = rawWeightSum / 20;
+          
+          Serial.print("Mittelwert mit Gewicht: ");
+          Serial.println(rawWithWeight2);
+          
+          long rawDiff2 = rawWithWeight2 - scale2.get_offset();
+          Serial.print("Reine Gewichts-Differenz: ");
+          Serial.println(rawDiff2);
+          
+          calFactor2 = (float)rawDiff2 / CALIBRATION_WEIGHT;
+          Serial.print("Neuer Kalibrierfaktor Zelle 2: ");
+          Serial.println(calFactor2, 3);
+          
+          scale2.set_scale(calFactor2);
+          scale2.tare();  // Tarieren mit richtigem Faktor
+          
+          delay(300);
+          float testReading = scale2.get_units(5);
+          Serial.print("Test nach Kalibrierung: ");
+          Serial.print(testReading, 1);
+          Serial.println(" g");
+        }
+        
+        calibrationStep = 5;
+        Serial.println("\n=== KALIBRIERUNG ABGESCHLOSSEN ===");
+        Serial.print("Kalibrierfaktor Zelle 1: ");
+        Serial.println(calFactor1, 3);
+        Serial.print("Kalibrierfaktor Zelle 2: ");
+        Serial.println(calFactor2, 3);
+        
+        // Nach der Kalibrierung zeigen wir die Faktoren an
+        updateDisplay();
+        delay(3000);
+        
+        // Zurück zum Normalmodus
+        calibrating = false;
+        calibrationStep = 0;
+        
+        // Sofort nach Kalibrierung tarieren
+        tareScales();
+        break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n=== ESP32 KAFFEEMUEHLE ===");
+  Serial.println("VERBESSERTE KALIBRIERUNG");
+  Serial.println("Referenzgewicht: " + String(CALIBRATION_WEIGHT) + "g");
+  
+  pinMode(TARE_PIN, INPUT_PULLUP);
+  pinMode(CAL_PIN, INPUT_PULLUP);
+  
+  initDisplay();
+  delay(1000);
+  
+  Serial.println("\nInitialisiere Wägezellen...");
+  scale1OK = initScale(scale1, DT1, SCK1, 1.0, "Wägezelle 1");
+  scale2OK = initScale(scale2, DT2, SCK2, 1.0, "Wägezelle 2");
+  
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  pinMode(START_SWITCH, INPUT_PULLUP);
+  
+  Serial.println("\n=== KALIBRIERUNGS-PROZESS ===");
+  Serial.println("1. CAL-Taste: Start");
+  Serial.println("2. Zelle 1 leer -> CAL");
+  Serial.println("3. " + String(CALIBRATION_WEIGHT) + "g auf Zelle 1 -> CAL");
+  Serial.println("4. Zelle 2 leer -> CAL");
+  Serial.println("5. " + String(CALIBRATION_WEIGHT) + "g auf Zelle 2 -> CAL");
+  Serial.println("6. Fertig - automatisches Tarieren");
+  
+  Serial.println("\n=== SYSTEM BEREIT ===");
+  updateDisplay();
+}
+
+void loop() {
+  unsigned long now = millis();
+  
+  // TARE Taste
+  if(!calibrating && digitalRead(TARE_PIN) == LOW && (now - lastTareTime) > DEBOUNCE_TIME) {
+    lastTareTime = now;
+    tareScales();
+  }
+  
+  // Kalibrierung
+  calibrateScale();
+  
+  // Wägezellen lesen
+  readScales();
+  
+  // Mahlung starten
+  static bool grinding = false;
+  if(!calibrating && digitalRead(START_SWITCH) == LOW && !grinding) {
+    grinding = true;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("Mahlung gestartet");
+    updateDisplay();
+    
+    while(totalWeight < (targetWeight - offset) && grinding) {
+      readScales();
+      
+      // Display regelmäßig aktualisieren
+      static unsigned long lastGrindUpdate = 0;
+      if(millis() - lastGrindUpdate > 200) {
+        updateDisplay();
+        lastGrindUpdate = millis();
+      }
+      
+      if(totalWeight > targetWeight * 1.5) {
+        Serial.println("SICHERHEIT: Zu schwer!");
+        break;
+      }
+      
+      delay(50);
+    }
+    
+    digitalWrite(RELAY_PIN, LOW);
+    grinding = false;
+    Serial.print("Mahlung beendet: ");
+    Serial.print(totalWeight, 1);
+    Serial.println(" g");
+    updateDisplay();
+    
+    delay(1000);
+  }
+  
+  // Display aktualisieren
+  static unsigned long lastUpdate = 0;
+  if(now - lastUpdate > 300) {
+    updateDisplay();
+    lastUpdate = now;
+  }
+  
+  delay(50);
+}
